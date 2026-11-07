@@ -14,8 +14,10 @@ No IP address needed. On every start the node generates:
 
 Jay sends bro just the PIN + ACCESS KEY. The node publishes how to
 reach it (LAN IPs, Tailscale IPs, and a Cloudflare tunnel URL when
-cloudflared is installed) to an ntfy.sh topic derived from
-sha256(access_key), so bro can find the node from the key alone.
+cloudflared is installed) as a retained MQTT message on public
+brokers (topic bronode/<sha256(access_key)>) and, secondarily, to an
+ntfy.sh topic derived the same way, so bro can find the node from
+the key alone.
 
 State lives in ~/.bro-node/ (job logs only; no key is stored anymore).
 """
@@ -29,6 +31,8 @@ import re
 import secrets
 import shutil
 import socket
+import ssl
+import struct
 import subprocess
 import sys
 import threading
@@ -46,11 +50,17 @@ NTFY_BASE = os.environ.get("BRO_NODE_NTFY_BASE", "https://ntfy.sh").rstrip("/")
 # --- session credentials: generated fresh on EVERY start, never stored ---
 PIN = "%06d" % (secrets.randbelow(900000) + 100000)
 ACCESS_KEY = secrets.token_urlsafe(24)
+SESSION_ID = uuid.uuid4().hex
 
 
 def rendezvous_topic():
     """Unguessable ntfy topic derived from the session access key."""
     return "bronode-" + hashlib.sha256(ACCESS_KEY.encode()).hexdigest()
+
+
+def mqtt_rendezvous_topic():
+    """MQTT topic derived from the session access key (same hash as ntfy)."""
+    return "bronode/" + hashlib.sha256(ACCESS_KEY.encode()).hexdigest()
 
 
 # Small catastrophic-command guard. This is a speed bump, not a sandbox:
@@ -265,7 +275,12 @@ def status(port, name):
     }
 
 
-# --- rendezvous: publish reachability to ntfy so bro needs no IP ---
+# --- rendezvous: publish reachability so bro needs no IP ---
+#
+# Primary: MQTT retained message on public brokers (topic derived from
+# the access key, so only key holders can find the node). Secondary:
+# ntfy.sh (kept from v2). Both are best-effort: failures are logged and
+# retried on the next 60s cycle, never fatal.
 
 
 def rendezvous_payload(port, name):
@@ -278,13 +293,14 @@ def rendezvous_payload(port, name):
         "tailscale_ips": ts,
         "tunnel_url": get_tunnel_url(),
         "ts": int(time.time()),
+        "session_id": SESSION_ID,
     }
 
 
-def publish_rendezvous(port, name):
+def publish_ntfy(payload):
     """POST the payload to the ntfy topic. Returns True on success."""
     url = NTFY_BASE + "/" + rendezvous_topic()
-    body = json.dumps(rendezvous_payload(port, name)).encode()
+    body = json.dumps(payload).encode()
     req = urllib.request.Request(url, data=body, method="POST")
     req.add_header("Content-Type", "text/plain; charset=utf-8")
     try:
@@ -293,6 +309,422 @@ def publish_rendezvous(port, name):
     except Exception as e:
         print("[rendezvous] publish failed (%s); will retry" % e, flush=True)
         return False
+
+
+# --- minimal MQTT 3.1.1 client (stdlib only) ---
+#
+# Transports, tried in order per broker:
+#   1. WebSocket (wss) with the vendored stdlib ws client below. Works
+#      through HTTP proxies: when http_proxy/https_proxy is set, the
+#      wss connection is opened through an HTTP CONNECT tunnel.
+#   2. Plain TCP to the broker's mqtt (1883) / mqtts (8883) ports.
+#
+# Sockets are kept in blocking mode with kernel SO_RCVTIMEO timeouts:
+# Python's timeout-mode (nonblocking + select) sockets stall behind
+# some egress proxies on non-443 ports; blocking + RCVTIMEO does not.
+
+MQTT_BROKERS = [
+    {
+        "name": "emqx",
+        "wss": [("broker.emqx.io", 8084, "/mqtt")],
+        "tcp": [("broker.emqx.io", 1883, False), ("broker.emqx.io", 8883, True)],
+    },
+    {
+        "name": "mosquitto",
+        "wss": [("test.mosquitto.org", 8081, "/mqtt"), ("test.mosquitto.org", 8081, "/")],
+        "tcp": [("test.mosquitto.org", 1883, False), ("test.mosquitto.org", 8883, True)],
+    },
+]
+
+
+def _sock_timeouts(s, sec):
+    try:
+        s.settimeout(None)
+    except Exception:
+        pass
+    tv = struct.pack("ll", int(sec), 0)
+    try:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVTIMEO, tv)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_SNDTIMEO, tv)
+    except OSError:
+        try:
+            s.settimeout(sec)
+        except Exception:
+            pass
+
+
+def _proxy_url():
+    for var in ("https_proxy", "HTTPS_PROXY", "http_proxy", "HTTP_PROXY"):
+        u = os.environ.get(var)
+        if u:
+            from urllib.parse import urlparse
+
+            p = urlparse(u if "://" in u else "http://" + u)
+            if p.hostname:
+                return p
+    return None
+
+
+def _no_proxy(host):
+    raw = os.environ.get("no_proxy") or os.environ.get("NO_PROXY") or ""
+    for item in raw.split(","):
+        item = item.strip().lstrip(".")
+        if item and (host == item or host.endswith("." + item)):
+            return True
+    return False
+
+
+def _open_connection(host, port, use_tls, timeout=15):
+    """TCP (optionally via proxy CONNECT) + optional TLS. Blocking mode."""
+    proxy = None if _no_proxy(host) else _proxy_url()
+    if proxy:
+        s = socket.create_connection((proxy.hostname, proxy.port or 3128), timeout=timeout)
+        _sock_timeouts(s, timeout)
+        auth = ""
+        if proxy.username:
+            cred = base64.b64encode(
+                ("%s:%s" % (proxy.username, proxy.password or "")).encode()
+            ).decode()
+            auth = "Proxy-Authorization: Basic %s\r\n" % cred
+        req = (
+            "CONNECT %s:%d HTTP/1.1\r\nHost: %s:%d\r\n%sProxy-Connection: Keep-Alive\r\n\r\n"
+            % (host, port, host, port, auth)
+        )
+        s.sendall(req.encode())
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            chunk = s.recv(4096)
+            if not chunk:
+                raise OSError("proxy closed during CONNECT")
+            buf += chunk
+            if len(buf) > 65536:
+                raise OSError("proxy CONNECT response too large")
+        status = buf.split(b"\r\n", 1)[0].decode("utf-8", "replace")
+        if " 200" not in status:
+            raise OSError("proxy CONNECT failed: %s" % status)
+    else:
+        s = socket.create_connection((host, port), timeout=timeout)
+        _sock_timeouts(s, timeout)
+    if use_tls:
+        ctx = ssl.create_default_context()
+        s = ctx.wrap_socket(s, server_hostname=host)
+        _sock_timeouts(s, timeout)
+    return s
+
+
+class _WSConn:
+    """Minimal WebSocket client: binary messages, ping/pong, no deps."""
+
+    def __init__(self, host, port, path, timeout=15):
+        self.sock = _open_connection(host, port, True, timeout)
+        key = base64.b64encode(os.urandom(16)).decode()
+        req = (
+            "GET %s HTTP/1.1\r\nHost: %s:%d\r\nUpgrade: websocket\r\n"
+            "Connection: Upgrade\r\nSec-WebSocket-Key: %s\r\n"
+            "Sec-WebSocket-Version: 13\r\nSec-WebSocket-Protocol: mqtt\r\n\r\n"
+            % (path, host, port, key)
+        )
+        self.sock.sendall(req.encode())
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            chunk = self.sock.recv(4096)
+            if not chunk:
+                raise OSError("websocket handshake closed")
+            buf += chunk
+            if len(buf) > 65536:
+                raise OSError("websocket handshake too large")
+        head, _, rest = buf.partition(b"\r\n\r\n")
+        status = head.split(b"\r\n", 1)[0].decode("utf-8", "replace")
+        if "101" not in status:
+            raise OSError("websocket handshake failed: %s" % status)
+        self.buf = rest
+
+    def _read_exact(self, n):
+        while len(self.buf) < n:
+            chunk = self.sock.recv(65536)
+            if not chunk:
+                raise OSError("websocket closed")
+            self.buf += chunk
+        out, self.buf = self.buf[:n], self.buf[n:]
+        return out
+
+    def _send_frame(self, opcode, data):
+        mask = os.urandom(4)
+        n = len(data)
+        if n < 126:
+            hdr = bytes([0x80 | opcode, 0x80 | n])
+        elif n < 65536:
+            hdr = bytes([0x80 | opcode, 0x80 | 126]) + struct.pack("!H", n)
+        else:
+            hdr = bytes([0x80 | opcode, 0x80 | 127]) + struct.pack("!Q", n)
+        masked = bytes(b ^ mask[i % 4] for i, b in enumerate(data))
+        self.sock.sendall(hdr + mask + masked)
+
+    def send_message(self, data):
+        self._send_frame(2, data)
+
+    def recv_message(self):
+        payload = b""
+        while True:
+            h = self._read_exact(2)
+            fin, op = h[0] & 0x80, h[0] & 0x0F
+            ln = h[1] & 0x7F
+            masked = h[1] & 0x80
+            if ln == 126:
+                ln = struct.unpack("!H", self._read_exact(2))[0]
+            elif ln == 127:
+                ln = struct.unpack("!Q", self._read_exact(8))[0]
+            mask = self._read_exact(4) if masked else None
+            data = self._read_exact(ln) if ln else b""
+            if mask:
+                data = bytes(b ^ mask[i % 4] for i, b in enumerate(data))
+            if op == 9:  # ping -> pong, keep reading
+                self._send_frame(10, data)
+                continue
+            if op == 8:
+                raise OSError("websocket close frame")
+            if op in (0, 1, 2):
+                payload += data
+                if fin:
+                    return payload
+
+    def close(self):
+        try:
+            self.sock.close()
+        except Exception:
+            pass
+
+
+def _enc_str(s):
+    b = s.encode() if isinstance(s, str) else s
+    return struct.pack("!H", len(b)) + b
+
+
+def _enc_rem(n):
+    out = b""
+    while True:
+        d = n % 128
+        n //= 128
+        if n > 0:
+            out += bytes([d | 0x80])
+        else:
+            out += bytes([d])
+            break
+    return out
+
+
+class _MQTTConn:
+    """One MQTT 3.1.1 session over a WS or raw-TCP transport."""
+
+    def __init__(self, transport, sock=None, ws=None):
+        self.transport = transport  # "ws" or "tcp"
+        self.sock = sock
+        self.ws = ws
+        self.buf = b""
+
+    @classmethod
+    def over_ws(cls, host, port, path, timeout=15):
+        return cls("ws", ws=_WSConn(host, port, path, timeout))
+
+    @classmethod
+    def over_tcp(cls, host, port, use_tls, timeout=12):
+        return cls("tcp", sock=_open_connection(host, port, use_tls, timeout))
+
+    def _fill(self):
+        if self.transport == "ws":
+            self.buf += self.ws.recv_message()
+        else:
+            chunk = self.sock.recv(65536)
+            if not chunk:
+                raise OSError("mqtt tcp closed")
+            self.buf += chunk
+
+    def send(self, packet):
+        if self.transport == "ws":
+            self.ws.send_message(packet)
+        else:
+            self.sock.sendall(packet)
+
+    def recv_packet(self):
+        """Return (packet_type, flags, body). Raises on close/timeout."""
+        while True:
+            if len(self.buf) >= 2:
+                # Decode remaining-length varint.
+                i = 1
+                rem = 0
+                mult = 1
+                complete = True
+                while True:
+                    if i >= len(self.buf):
+                        complete = False
+                        break
+                    b = self.buf[i]
+                    i += 1
+                    rem += (b & 127) * mult
+                    mult *= 128
+                    if not (b & 128):
+                        break
+                if complete and len(self.buf) >= i + rem:
+                    head = self.buf[0]
+                    body = self.buf[i:i + rem]
+                    self.buf = self.buf[i + rem:]
+                    return head >> 4, head & 0x0F, body
+            self._fill()
+
+    def connect(self, client_id):
+        var = _enc_str("MQTT") + bytes([4, 0x02]) + struct.pack("!H", 60)
+        body = var + _enc_str(client_id)
+        self.send(bytes([0x10]) + _enc_rem(len(body)) + body)
+        ptype, _, body = self.recv_packet()
+        if ptype != 2 or len(body) < 2 or body[1] != 0:
+            raise OSError("MQTT CONNACK refused (type=%s body=%s)" % (ptype, body.hex()))
+
+    def ping(self):
+        self.send(bytes([0xC0, 0x00]))
+
+    def publish_qos1(self, topic, payload, packet_id=7):
+        var = _enc_str(topic) + struct.pack("!H", packet_id)
+        pkt = bytes([0x33]) + _enc_rem(len(var) + len(payload)) + var + payload  # QoS1 + RETAIN
+        self.send(pkt)
+        while True:
+            ptype, _, body = self.recv_packet()
+            if ptype == 4:  # PUBACK
+                if len(body) >= 2 and struct.unpack("!H", body[:2])[0] == packet_id:
+                    return
+            # Any other packet (PINGRESP etc.) is fine; keep waiting.
+
+    def subscribe_read(self, topic, packet_id=9, wait_s=10):
+        """SUBSCRIBE and return the retained payload for topic, or None."""
+        body = struct.pack("!H", packet_id) + _enc_str(topic) + bytes([1])
+        self.send(bytes([0x82]) + _enc_rem(len(body)) + body)
+        deadline = time.time() + wait_s
+        pinged = False
+        while time.time() < deadline:
+            try:
+                ptype, flags, body = self.recv_packet()
+            except (OSError, socket.error):
+                if not pinged:
+                    # Quiet broker or slow retained delivery: nudge with
+                    # PINGREQ once, then keep waiting out the deadline.
+                    try:
+                        self.ping()
+                    except Exception:
+                        return None
+                    pinged = True
+                    continue
+                return None
+            if ptype == 3:  # PUBLISH
+                if len(body) < 2:
+                    continue
+                tl = struct.unpack("!H", body[:2])[0]
+                tpc = body[2:2 + tl].decode("utf-8", "replace")
+                off = 2 + tl
+                if (flags >> 1) & 3:  # QoS > 0 carries a packet id
+                    off += 2
+                if tpc == topic:
+                    return body[off:]
+            # SUBACK / PINGRESP / anything else: keep waiting.
+        return None
+
+    def close(self):
+        try:
+            self.send(bytes([0xE0, 0x00]))  # DISCONNECT
+        except Exception:
+            pass
+        try:
+            if self.transport == "ws":
+                self.ws.close()
+            elif self.sock:
+                self.sock.close()
+        except Exception:
+            pass
+
+
+def _mqtt_client_id(tag):
+    return "bronode-%s-%s" % (tag, uuid.uuid4().hex[:10])
+
+
+def _broker_transports(broker):
+    """Yield (label, connect_fn) for one broker, WSS first, then TCP."""
+    for host, port, path in broker["wss"]:
+        yield (
+            "wss://%s:%d%s" % (host, port, path),
+            lambda h=host, p=port, pa=path: _MQTTConn.over_ws(h, p, pa, timeout=15),
+        )
+    for host, port, use_tls in broker["tcp"]:
+        scheme = "mqtts" if use_tls else "mqtt"
+        yield (
+            "%s://%s:%d" % (scheme, host, port),
+            lambda h=host, p=port, t=use_tls: _MQTTConn.over_tcp(h, p, t, timeout=10),
+        )
+
+
+def mqtt_publish(topic, payload):
+    """Publish a retained QoS1 message to each broker. Returns the list
+    of broker names that accepted it (empty = total failure)."""
+    done = []
+    for broker in MQTT_BROKERS:
+        last_err = None
+        broker_ok = False
+        for label, connect in _broker_transports(broker):
+            conn = None
+            try:
+                conn = connect()
+                conn.connect(_mqtt_client_id("pub"))
+                conn.publish_qos1(topic, payload)
+                done.append("%s via %s" % (broker["name"], label))
+                broker_ok = True
+                break
+            except Exception as e:
+                last_err = e
+            finally:
+                if conn:
+                    conn.close()
+        if not broker_ok:
+            print(
+                "[rendezvous] mqtt publish to %s failed (%s); will retry"
+                % (broker["name"], last_err),
+                flush=True,
+            )
+    return done
+
+
+def mqtt_fetch(topic, wait_s=10):
+    """Read the retained message for topic. Returns (payload, label)
+    or (None, None). Tries brokers in order, WSS before TCP."""
+    for broker in MQTT_BROKERS:
+        for label, connect in _broker_transports(broker):
+            conn = None
+            try:
+                conn = connect()
+                conn.connect(_mqtt_client_id("sub"))
+                payload = conn.subscribe_read(topic, wait_s=wait_s)
+                if payload is not None:
+                    return payload, "%s via %s" % (broker["name"], label)
+                # Connected fine but nothing retained here: the answer
+                # cannot differ per transport on the same broker.
+                break
+            except Exception:
+                continue
+            finally:
+                if conn:
+                    conn.close()
+    return None, None
+
+
+def publish_rendezvous(port, name):
+    """Publish the payload via MQTT (primary) and ntfy (secondary).
+    Returns True if at least one rendezvous accepted it."""
+    payload = rendezvous_payload(port, name)
+    ok = False
+    try:
+        if mqtt_publish(mqtt_rendezvous_topic(), json.dumps(payload).encode()):
+            ok = True
+    except Exception as e:
+        print("[rendezvous] mqtt publish failed (%s); will retry" % e, flush=True)
+    if publish_ntfy(payload):
+        ok = True
+    return ok
 
 
 def rendezvous_loop(port, name):

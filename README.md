@@ -46,8 +46,19 @@ it prints a **PIN** and an **ACCESS KEY**:
 The access key is **different on every start**. Restart the server and
 the old key stops working and a new one is printed, so every restart
 means sending bro the new key. The node quietly publishes how to reach
-it (to an unguessable rendezvous topic derived from the access key),
-so bro can find the machine from the PIN + key alone.
+it, so bro can find the machine from the PIN + key alone.
+
+How the lookup works: the node publishes its reachability info as a
+**retained message on a public MQTT broker** (EMQX, with the
+test.mosquitto.org broker as fallback), on a topic derived from the
+access key itself: `bronode/<sha256 of the access key>`. Only someone
+holding the access key can derive that topic, so only key holders can
+find the node. Bro's client reads that retained message first, then
+dials the announced addresses (Cloudflare tunnel, Tailscale, LAN) and
+verifies the node with the PIN + key before trusting it. An ntfy.sh
+topic derived the same way is kept as a secondary lookup. The payload
+is republished every 60 seconds, and a payload older than 5 minutes
+warns that the node may have restarted and rotated its key.
 
 ## Termux (Android phone / tablet)
 
