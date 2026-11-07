@@ -8,6 +8,22 @@ Python 3. Works on Linux and on Android through Termux.
 This is separate from the older linuxtomux bridge: bro-node is the
 stripped-down version. Start the server, send bro two short things, done.
 
+## Quick start (tablet / phone)
+
+In Termux, run these one line at a time. Type a line, press Enter,
+wait for it to finish, then type the next one:
+
+```
+pkg install -y python git termux-api
+git clone https://github.com/jaykk99/bro-node
+cd bro-node
+termux-wake-lock
+python server.py
+```
+
+When the server starts it prints a PIN and an ACCESS KEY. Send bro
+both of those and nothing else. The key is new every start.
+
 ## No IP address needed
 
 You do NOT give bro an IP address anymore. Every time the server starts
