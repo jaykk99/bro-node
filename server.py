@@ -1,22 +1,28 @@
 #!/usr/bin/env python3
-"""bro-node: a tiny remote-hands server.
+"""bro-node: a tiny remote-hands server (v2: PIN + fresh access key).
 
 Run this on any machine (Linux PC, or Android via Termux) and bro can
-connect with the pairing key to run commands, move files, and use the
-machine as extra processing power. Standard library only, no installs
-beyond Python 3 itself.
+connect and work: run commands, move files, use the machine as extra
+processing power. Standard library only, no installs beyond Python 3.
 
-Usage:
     python3 server.py [--port 8899] [--name mypc]
 
-State lives in ~/.bro-node/ (pairing key, job logs). The pairing key is
-printed on start. Whoever holds the key controls the machine, so only
-share it with bro, and do not port-forward this to the open internet
-(use Tailscale for remote access instead).
+No IP address needed. On every start the node generates:
+  - a 6-digit PIN
+  - a FRESH random ACCESS KEY (different every start; the previous
+    start's key stops working the moment the node restarts)
+
+Jay sends bro just the PIN + ACCESS KEY. The node publishes how to
+reach it (LAN IPs, Tailscale IPs, and a Cloudflare tunnel URL when
+cloudflared is installed) to an ntfy.sh topic derived from
+sha256(access_key), so bro can find the node from the key alone.
+
+State lives in ~/.bro-node/ (job logs only; no key is stored anymore).
 """
 
 import argparse
 import base64
+import hashlib
 import json
 import os
 import re
@@ -27,17 +33,29 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HOME_DIR = os.environ.get("BRO_NODE_HOME", os.path.expanduser("~/.bro-node"))
-KEY_FILE = os.path.join(HOME_DIR, "pairing-key")
 JOBS_DIR = os.path.join(HOME_DIR, "jobs")
 MAX_OUT = 256 * 1024
+NTFY_BASE = os.environ.get("BRO_NODE_NTFY_BASE", "https://ntfy.sh").rstrip("/")
+
+# --- session credentials: generated fresh on EVERY start, never stored ---
+PIN = "%06d" % (secrets.randbelow(900000) + 100000)
+ACCESS_KEY = secrets.token_urlsafe(24)
+
+
+def rendezvous_topic():
+    """Unguessable ntfy topic derived from the session access key."""
+    return "bronode-" + hashlib.sha256(ACCESS_KEY.encode()).hexdigest()
+
 
 # Small catastrophic-command guard. This is a speed bump, not a sandbox:
-# anyone with the pairing key is trusted, but a typo should not be able
-# to wipe the machine.
+# anyone with the PIN + access key is trusted, but a typo should not be
+# able to wipe the machine.
 GUARDS = [
     re.compile(r"rm\s+-[a-z]*r[a-z]*f[a-z]*\s+/\s*$"),
     re.compile(r"rm\s+-[a-z]*r[a-z]*f[a-z]*\s+/\s"),
@@ -48,22 +66,17 @@ GUARDS = [
     re.compile(r">\s*/dev/(sd|nvme|mmcblk)"),
 ]
 
-
-def load_key():
-    os.makedirs(HOME_DIR, exist_ok=True)
-    if os.path.exists(KEY_FILE):
-        with open(KEY_FILE) as f:
-            return f.read().strip()
-    key = secrets.token_urlsafe(24)
-    fd = os.open(KEY_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as f:
-        f.write(key + "\n")
-    return key
-
-
-PAIR_KEY = load_key()
 JOBS = {}
 JOBS_LOCK = threading.Lock()
+
+# Set by the tunnel thread when cloudflared gives us a public URL.
+TUNNEL_URL = None
+TUNNEL_LOCK = threading.Lock()
+
+
+def get_tunnel_url():
+    with TUNNEL_LOCK:
+        return TUNNEL_URL
 
 
 def shell_prefix():
@@ -173,7 +186,7 @@ def battery():
     return None
 
 
-def lan_ips():
+def all_ips():
     ips = []
     try:
         out = subprocess.run(["hostname", "-I"], capture_output=True, text=True, timeout=5)
@@ -191,6 +204,33 @@ def lan_ips():
     return ips
 
 
+def split_ips():
+    """(lan_ips, tailscale_ips): Tailscale addresses live in 100.64.0.0/10.
+
+    BRO_NODE_ADVERTISE_IPS (comma-separated) overrides auto-detection,
+    for multi-homed machines or containers whose hostname -I addresses
+    are not the ones peers should dial.
+    """
+    override = os.environ.get("BRO_NODE_ADVERTISE_IPS", "").strip()
+    ips = [s.strip() for s in override.split(",") if s.strip()] if override else all_ips()
+    lan, ts = [], []
+    for ip in ips:
+        parts = ip.split(".")
+        is_ts = False
+        if len(parts) == 4 and parts[0] == "100":
+            try:
+                is_ts = 64 <= int(parts[1]) <= 127
+            except ValueError:
+                is_ts = False
+        (ts if is_ts else lan).append(ip)
+    return lan, ts
+
+
+def lan_ips():
+    lan, ts = split_ips()
+    return lan + ts
+
+
 def status(port, name):
     mem_total = mem_avail = None
     try:
@@ -203,6 +243,7 @@ def status(port, name):
     except OSError:
         pass
     disk = shutil.disk_usage(os.path.expanduser("~"))
+    lan, ts = split_ips()
     return {
         "node": name,
         "hostname": socket.gethostname(),
@@ -215,10 +256,78 @@ def status(port, name):
         "disk_free_gb": round(disk.free / 1e9, 1),
         "disk_total_gb": round(disk.total / 1e9, 1),
         "battery": battery(),
-        "ips": lan_ips(),
+        "ips": lan + ts,
+        "lan_ips": lan,
+        "tailscale_ips": ts,
+        "tunnel_url": get_tunnel_url(),
         "port": port,
         "uptime_s": None,
     }
+
+
+# --- rendezvous: publish reachability to ntfy so bro needs no IP ---
+
+
+def rendezvous_payload(port, name):
+    lan, ts = split_ips()
+    return {
+        "pin": PIN,
+        "name": name,
+        "port": port,
+        "lan_ips": lan,
+        "tailscale_ips": ts,
+        "tunnel_url": get_tunnel_url(),
+        "ts": int(time.time()),
+    }
+
+
+def publish_rendezvous(port, name):
+    """POST the payload to the ntfy topic. Returns True on success."""
+    url = NTFY_BASE + "/" + rendezvous_topic()
+    body = json.dumps(rendezvous_payload(port, name)).encode()
+    req = urllib.request.Request(url, data=body, method="POST")
+    req.add_header("Content-Type", "text/plain; charset=utf-8")
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return 200 <= r.status < 300
+    except Exception as e:
+        print("[rendezvous] publish failed (%s); will retry" % e, flush=True)
+        return False
+
+
+def rendezvous_loop(port, name):
+    while True:
+        publish_rendezvous(port, name)
+        time.sleep(60)
+
+
+# --- optional Cloudflare quick tunnel ---
+
+
+def tunnel_loop(port, name):
+    global TUNNEL_URL
+    exe = shutil.which("cloudflared")
+    if not exe:
+        return
+    try:
+        p = subprocess.Popen(
+            [exe, "tunnel", "--url", "http://127.0.0.1:%d" % port],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+    except Exception as e:
+        print("[tunnel] cloudflared failed to start: %s" % e, flush=True)
+        return
+    pat = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com")
+    for line in p.stdout:
+        m = pat.search(line)
+        if m:
+            with TUNNEL_LOCK:
+                TUNNEL_URL = m.group(0)
+            print("[tunnel] public URL: %s" % TUNNEL_URL, flush=True)
+            publish_rendezvous(port, name)
+            break
 
 
 CONSOLE = """<!doctype html>
@@ -226,10 +335,11 @@ CONSOLE = """<!doctype html>
 <title>bro-node</title>
 <body style="background:#0a0b0d;color:#e8e8e8;font-family:monospace;padding:24px">
 <h2>bro-node is running</h2>
-<p>This machine is available to bro with its pairing key.</p>
+<p>This machine is available to bro with this session's PIN + access key.</p>
 <pre id="s">loading status...</pre>
 <script>
-fetch('/api/status', {headers: {'X-Pair-Key': new URLSearchParams(location.search).get('key') || ''}})
+var q = new URLSearchParams(location.search);
+fetch('/api/status', {headers: {'X-Pair-Key': q.get('key') || '', 'X-Pin': q.get('pin') || ''}})
   .then(r => r.json()).then(j => document.getElementById('s').textContent = JSON.stringify(j, null, 2))
   .catch(e => document.getElementById('s').textContent = 'status failed: ' + e);
 </script>
@@ -245,12 +355,14 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     def authed(self):
-        key = self.headers.get("X-Pair-Key", "")
-        if not key:
-            from urllib.parse import urlparse, parse_qs
+        # BOTH required: X-Pin header must equal the session PIN and
+        # X-Pair-Key (or ?key=) must equal the current session access key.
+        from urllib.parse import urlparse, parse_qs
 
-            key = parse_qs(urlparse(self.path).query).get("key", [""])[0]
-        return secrets.compare_digest(key, PAIR_KEY)
+        q = parse_qs(urlparse(self.path).query)
+        pin = self.headers.get("X-Pin", "") or q.get("pin", [""])[0]
+        key = self.headers.get("X-Pair-Key", "") or q.get("key", [""])[0]
+        return secrets.compare_digest(pin, PIN) and secrets.compare_digest(key, ACCESS_KEY)
 
     def send_json(self, code, obj):
         body = json.dumps(obj).encode()
@@ -279,7 +391,7 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(body)
             return
         if not self.authed():
-            return self.send_json(401, {"error": "pairing key required"})
+            return self.send_json(401, {"error": "valid PIN + access key required"})
         if u.path == "/api/status":
             return self.send_json(200, status(self.port, self.name))
         if u.path.startswith("/api/job/"):
@@ -304,7 +416,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         if not self.authed():
-            return self.send_json(401, {"error": "pairing key required"})
+            return self.send_json(401, {"error": "valid PIN + access key required"})
         from urllib.parse import urlparse
 
         u = urlparse(self.path)
@@ -339,15 +451,23 @@ def main():
     ap.add_argument("--port", type=int, default=int(os.environ.get("BRO_NODE_PORT", "8899")))
     ap.add_argument("--name", default=os.environ.get("BRO_NODE_NAME", socket.gethostname()))
     args = ap.parse_args()
+    os.makedirs(HOME_DIR, exist_ok=True)
     Handler.port = args.port
     Handler.name = args.name
     srv = ThreadingHTTPServer(("0.0.0.0", args.port), Handler)
-    print("bro-node '%s' listening on port %d" % (args.name, args.port))
-    print("pairing key: %s" % PAIR_KEY)
-    for ip in lan_ips() or ["127.0.0.1"]:
-        print("  http://%s:%d" % (ip, args.port))
-    print("CONNECT LINE for bro: bro-node http://<this-machine-ip>:%d key %s" % (args.port, PAIR_KEY))
-    print("Keep this terminal open. Ctrl-C stops the node.")
+
+    threading.Thread(target=tunnel_loop, args=(args.port, args.name), daemon=True).start()
+    threading.Thread(target=rendezvous_loop, args=(args.port, args.name), daemon=True).start()
+
+    print("=" * 56, flush=True)
+    print("  bro-node is running: %s" % args.name, flush=True)
+    print("", flush=True)
+    print("  PIN:        %s" % PIN, flush=True)
+    print("  ACCESS KEY: %s" % ACCESS_KEY, flush=True)
+    print("", flush=True)
+    print("  Tell bro: PIN %s + ACCESS KEY (above)" % PIN, flush=True)
+    print("  The access key is new every start. Keep this terminal open.", flush=True)
+    print("=" * 56, flush=True)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

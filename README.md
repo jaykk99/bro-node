@@ -6,30 +6,69 @@ One Python file, standard library only, nothing else to install beyond
 Python 3. Works on Linux and on Android through Termux.
 
 This is separate from the older linuxtomux bridge: bro-node is the
-stripped-down version. Start server, hand bro the connect line, done.
+stripped-down version. Start the server, send bro two short things, done.
 
-## Termux (Android phone)
+## No IP address needed
 
-Paste this into Termux:
+You do NOT give bro an IP address anymore. Every time the server starts
+it prints a **PIN** and an **ACCESS KEY**:
 
-```sh
-pkg update -y && pkg install -y python git termux-api
-git clone https://github.com/jaykk99/bro-node
-cd bro-node && python server.py
+```
+================================================
+  bro-node is running: <your machine>
+
+  PIN:        123456
+  ACCESS KEY: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+
+  Tell bro: PIN 123456 + ACCESS KEY (above)
+  The access key is new every start. Keep this terminal open.
+================================================
 ```
 
-Keep the phone awake while it works:
+**Send bro the PIN and the ACCESS KEY. Nothing else.**
 
-```sh
+The access key is **different on every start**. Restart the server and
+the old key stops working and a new one is printed, so every restart
+means sending bro the new key. The node quietly publishes how to reach
+it (to an unguessable rendezvous topic derived from the access key),
+so bro can find the machine from the PIN + key alone.
+
+## Termux (Android phone / tablet)
+
+Run these commands in Termux, **one line at a time**. Type a line,
+press Enter, wait for it to finish, then type the next one:
+
+```
+pkg install -y python git termux-api
+```
+
+```
+git clone https://github.com/jaykk99/bro-node
+```
+
+```
+cd bro-node
+```
+
+```
 termux-wake-lock
 ```
+
+```
+python server.py
+```
+
+Then send bro the PIN and ACCESS KEY it prints.
 
 ## Linux (PC, laptop, server)
 
 ```sh
 git clone https://github.com/jaykk99/bro-node
-cd bro-node && python3 server.py
+cd bro-node
+python3 server.py
 ```
+
+Then send bro the PIN and ACCESS KEY it prints.
 
 To keep it running after you close the terminal:
 
@@ -37,21 +76,29 @@ To keep it running after you close the terminal:
 cd bro-node && nohup python3 server.py > ~/.bro-node/server.log 2>&1 &
 ```
 
-## Hand it to bro
+(The new PIN + key are in that log file. Remember: a restart means a
+new key.)
 
-On start, the server prints a line like:
+## Reaching the node from outside home wifi (optional)
+
+On the same wifi/network, bro can reach the node directly once another
+bro-connected machine is on that network, and over Tailscale if both
+ends run it.
+
+For direct access from anywhere, install `cloudflared` on the node
+machine. bro-node starts a Cloudflare tunnel by itself when it finds
+the binary, and publishes the tunnel address with the rendezvous info:
 
 ```
-CONNECT LINE for bro: bro-node http://<this-machine-ip>:8899 key <pairing-key>
+pkg install cloudflared
 ```
 
-Send that line to bro. With it he can check the machine's status, run
-commands, start long background jobs, and move files on and off.
+(Termux: `pkg install cloudflared`. Linux: install the cloudflared
+package for your distro.)
 
-- Same wifi/network: the printed address just works.
-- From anywhere else: put both machines on Tailscale and use the
-  machine's Tailscale address instead. Do not port-forward this server
-  to the open internet; the pairing key is the only lock on the door.
+Without cloudflared, bro needs a Tailscale or same-network path from
+another connected node. Do not port-forward this server to the open
+internet yourself; the PIN + access key are the only lock on the door.
 
 ## What bro can do with it
 
@@ -59,13 +106,19 @@ commands, start long background jobs, and move files on and off.
 - `POST /api/exec` — run a shell command, get stdout/stderr/exit back.
 - `POST /api/job` + `GET /api/job/<id>` — long background jobs with logs.
 - `GET /api/file?path=` / `POST /api/file` — download / upload files.
-- `client.py` in this repo is the matching command-line client.
+- `client.py` in this repo is the matching command-line client:
+
+```sh
+python3 client.py --pin 123456 --key <access_key> status
+python3 client.py --pin 123456 --key <access_key> exec "uname -a"
+```
 
 ## Safety shape
 
-- Every API call needs the pairing key (`X-Pair-Key` header). The key is
-  generated once and stored at `~/.bro-node/pairing-key` with 0600 perms.
+- Every API call needs BOTH the PIN (`X-Pin` header) and the current
+  session access key (`X-Pair-Key` header). Both are generated fresh
+  with the `secrets` module on every start and are never stored on disk.
 - A small guard blocks catastrophic typos (`rm -rf /`, mkfs, dd onto a
-  raw device, shutdown). It is a speed bump, not a sandbox: whoever holds
-  the key is trusted, so treat the key like a password.
-- State and job logs live in `~/.bro-node/`.
+  raw device, shutdown). It is a speed bump, not a sandbox: whoever
+  holds the PIN + key is trusted, so treat them like a password.
+- Job logs live in `~/.bro-node/` (override with `BRO_NODE_HOME`).
