@@ -64,7 +64,10 @@ def fetch_rendezvous(pin, key, ntfy_base=NTFY_BASE):
     url = "%s/%s/json?poll=1" % (ntfy_base, rendezvous_topic(key))
     req = urllib.request.Request(url)
     best = None
-    with urllib.request.urlopen(req, timeout=20) as r:
+    opener = urllib.request.build_opener(
+        urllib.request.HTTPSHandler(context=make_ssl_context())
+    )
+    with opener.open(req, timeout=20) as r:
         for raw in r:
             raw = raw.strip()
             if not raw:
@@ -101,11 +104,13 @@ MQTT_BROKERS = [
     {
         "name": "emqx",
         "wss": [("broker.emqx.io", 8084, "/mqtt")],
+        "ws": [("broker.emqx.io", 8083, "/mqtt")],
         "tcp": [("broker.emqx.io", 1883, False), ("broker.emqx.io", 8883, True)],
     },
     {
         "name": "mosquitto",
         "wss": [("test.mosquitto.org", 8081, "/mqtt"), ("test.mosquitto.org", 8081, "/")],
+        "ws": [("test.mosquitto.org", 8080, "/mqtt")],
         "tcp": [("test.mosquitto.org", 1883, False), ("test.mosquitto.org", 8883, True)],
     },
 ]
@@ -113,6 +118,65 @@ MQTT_BROKERS = [
 
 def mqtt_rendezvous_topic(key):
     return "bronode/" + hashlib.sha256(key.encode()).hexdigest()
+
+
+TLS_DEGRADED = [False]  # True once we fall back to unverified TLS
+
+
+def _ca_bundle():
+    """Locate a CA bundle file, including Termux and old-distro paths."""
+    env = os.environ.get("SSL_CERT_FILE")
+    if env and os.path.exists(env):
+        return env
+    prefix = os.environ.get("PREFIX", "")
+    candidates = []
+    if prefix:
+        candidates.append(os.path.join(prefix, "etc/tls/cert.pem"))
+        candidates.append(os.path.join(prefix, "etc/ssl/certs/ca-certificates.crt"))
+    candidates.extend(
+        [
+            "/etc/tls/cert.pem",
+            "/etc/ssl/certs/ca-certificates.crt",
+            "/etc/pki/tls/certs/ca-bundle.crt",
+            "/etc/ssl/cert.pem",
+            "/etc/ssl/certs/ca-bundle.crt",
+            os.path.expanduser("~/.termux/ssl/cert.pem"),
+        ]
+    )
+    for path in candidates:
+        if path and os.path.exists(path):
+            return path
+    return None
+
+
+def make_ssl_context():
+    """A verified TLS context using the best CA bundle we can find."""
+    bundle = _ca_bundle()
+    try:
+        if bundle:
+            return ssl.create_default_context(cafile=bundle)
+        return ssl.create_default_context()
+    except Exception:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_SSLv23)
+        ctx.verify_mode = ssl.CERT_REQUIRED
+        return ctx
+
+
+def _cert_verify_failed(e):
+    if isinstance(e, getattr(ssl, "CertificateError", ())):
+        return True
+    msg = str(e).lower()
+    needles = (
+        "certificate_verify_failed",
+        "certificate verify failed",
+        "self-signed certificate",
+        "self signed certificate",
+        "unable to get local issuer",
+        "certificate has expired",
+        "doesn't match",
+        "not trusted",
+    )
+    return any(n in msg for n in needles)
 
 
 def _sock_timeouts(s, sec):
@@ -152,8 +216,8 @@ def _no_proxy(host):
     return False
 
 
-def _open_connection(host, port, use_tls, timeout=15):
-    """TCP (optionally via proxy CONNECT) + optional TLS. Blocking mode."""
+def _open_plain(host, port, timeout=15):
+    """Plain TCP (optionally via proxy CONNECT). Blocking mode."""
     proxy = None if _no_proxy(host) else _proxy_url()
     if proxy:
         s = socket.create_connection((proxy.hostname, proxy.port or 3128), timeout=timeout)
@@ -180,21 +244,58 @@ def _open_connection(host, port, use_tls, timeout=15):
         status = buf.split(b"\r\n", 1)[0].decode("utf-8", "replace")
         if " 200" not in status:
             raise OSError("proxy CONNECT failed: %s" % status)
-    else:
-        s = socket.create_connection((host, port), timeout=timeout)
-        _sock_timeouts(s, timeout)
-    if use_tls:
-        ctx = ssl.create_default_context()
-        s = ctx.wrap_socket(s, server_hostname=host)
-        _sock_timeouts(s, timeout)
+        return s
+    s = socket.create_connection((host, port), timeout=timeout)
+    _sock_timeouts(s, timeout)
     return s
+
+
+def _open_connection(host, port, use_tls, timeout=15):
+    """TCP + optional TLS. Blocking mode.
+
+    Old Android/Termux and old Linux installs often have no usable CA
+    store, so certificate verification fails outright. When that (and
+    only that) happens, reconnect once and retry without verification:
+    a found node beats no node, and the session access key itself never
+    travels over these rendezvous connections."""
+    s = _open_plain(host, port, timeout)
+    if not use_tls:
+        return s
+    try:
+        s2 = make_ssl_context().wrap_socket(s, server_hostname=host)
+        _sock_timeouts(s2, timeout)
+        return s2
+    except ssl.SSLError as e:
+        if not _cert_verify_failed(e):
+            raise
+        try:
+            s.close()
+        except Exception:
+            pass
+        if not TLS_DEGRADED[0]:
+            TLS_DEGRADED[0] = True
+            print(
+                "[tls] certificate verification failed on this device; "
+                "retrying without verification (old/missing CA store). "
+                "Only rendezvous traffic uses this.",
+                flush=True,
+            )
+        s = _open_plain(host, port, timeout)
+        if hasattr(ssl, "_create_unverified_context"):
+            ctx = ssl._create_unverified_context()
+        else:
+            ctx = ssl.SSLContext(ssl.PROTOCOL_SSLv23)
+            ctx.verify_mode = ssl.CERT_NONE
+        s2 = ctx.wrap_socket(s, server_hostname=host)
+        _sock_timeouts(s2, timeout)
+        return s2
 
 
 class _WSConn:
     """Minimal WebSocket client: binary messages, ping/pong, no deps."""
 
-    def __init__(self, host, port, path, timeout=15):
-        self.sock = _open_connection(host, port, True, timeout)
+    def __init__(self, host, port, path, timeout=15, use_tls=True):
+        self.sock = _open_connection(host, port, use_tls, timeout)
         key = base64.b64encode(os.urandom(16)).decode()
         req = (
             "GET %s HTTP/1.1\r\nHost: %s:%d\r\nUpgrade: websocket\r\n"
@@ -301,8 +402,8 @@ class _MQTTConn:
         self.buf = b""
 
     @classmethod
-    def over_ws(cls, host, port, path, timeout=15):
-        return cls("ws", ws=_WSConn(host, port, path, timeout))
+    def over_ws(cls, host, port, path, timeout=15, use_tls=True):
+        return cls("ws", ws=_WSConn(host, port, path, timeout, use_tls))
 
     @classmethod
     def over_tcp(cls, host, port, use_tls, timeout=12):
@@ -408,11 +509,19 @@ def _mqtt_client_id(tag):
 
 
 def _broker_transports(broker):
-    """Yield (label, connect_fn) for one broker, WSS first, then TCP."""
+    """Yield (label, connect_fn) for one broker: WSS first, then plain
+    WS (for devices whose TLS cannot work at all), then raw TCP."""
     for host, port, path in broker["wss"]:
         yield (
             "wss://%s:%d%s" % (host, port, path),
             lambda h=host, p=port, pa=path: _MQTTConn.over_ws(h, p, pa, timeout=15),
+        )
+    for host, port, path in broker.get("ws", []):
+        yield (
+            "ws://%s:%d%s" % (host, port, path),
+            lambda h=host, p=port, pa=path: _MQTTConn.over_ws(
+                h, p, pa, timeout=15, use_tls=False
+            ),
         )
     for host, port, use_tls in broker["tcp"]:
         scheme = "mqtts" if use_tls else "mqtt"

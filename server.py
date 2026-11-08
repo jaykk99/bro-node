@@ -1,9 +1,17 @@
 #!/usr/bin/env python3
-"""bro-node: a tiny remote-hands server (v2: PIN + fresh access key).
+"""bro-node: a tiny remote-hands server (v2.2: PIN + fresh access key).
 
 Run this on any machine (Linux PC, or Android via Termux) and bro can
 connect and work: run commands, move files, use the machine as extra
 processing power. Standard library only, no installs beyond Python 3.
+
+Old gear is welcome (v2.2): the floor is Python 3.6, so old Termux /
+old Android and old Linux distros can run it. When a device has no
+usable CA store (the classic Termux CERTIFICATE_VERIFY_FAILED), TLS
+verification falls back instead of failing outright, plain (non-TLS)
+broker transports are in the rendezvous rotation, and when
+cloudflared is unavailable or cannot run, an ssh reverse tunnel
+(localhost.run) is tried instead.
 
     python3 server.py [--port 8899] [--name mypc]
 
@@ -40,7 +48,15 @@ import time
 import urllib.error
 import urllib.request
 import uuid
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+try:
+    from http.server import ThreadingHTTPServer
+except ImportError:  # Python 3.6 has no ThreadingHTTPServer
+    import socketserver
+
+    class ThreadingHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
+        daemon_threads = True
 
 HOME_DIR = os.environ.get("BRO_NODE_HOME", os.path.expanduser("~/.bro-node"))
 JOBS_DIR = os.path.join(HOME_DIR, "jobs")
@@ -107,8 +123,9 @@ def run_cmd(cmd, timeout_s, cwd=None):
     try:
         p = subprocess.run(
             shell_prefix() + [cmd],
-            capture_output=True,
-            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
             timeout=timeout_s,
             cwd=cwd or os.path.expanduser("~"),
         )
@@ -180,7 +197,13 @@ def battery():
     exe = shutil.which("termux-battery-status")
     if exe:
         try:
-            out = subprocess.run([exe], capture_output=True, text=True, timeout=5)
+            out = subprocess.run(
+                [exe],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                universal_newlines=True,
+                timeout=5,
+            )
             return json.loads(out.stdout)
         except Exception:
             pass
@@ -199,10 +222,32 @@ def battery():
 def all_ips():
     ips = []
     try:
-        out = subprocess.run(["hostname", "-I"], capture_output=True, text=True, timeout=5)
+        out = subprocess.run(
+            ["hostname", "-I"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+            timeout=5,
+        )
         ips = out.stdout.split()
     except Exception:
         pass
+    if not ips:
+        # No `hostname` here (old Termux/Android): try iproute2.
+        try:
+            out = subprocess.run(
+                ["ip", "-4", "-o", "addr", "show", "scope", "global"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                universal_newlines=True,
+                timeout=5,
+            )
+            for line in out.stdout.splitlines():
+                parts = line.split()
+                if "inet" in parts:
+                    ips.append(parts[parts.index("inet") + 1].split("/")[0])
+        except Exception:
+            pass
     if not ips:
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -254,13 +299,17 @@ def status(port, name):
         pass
     disk = shutil.disk_usage(os.path.expanduser("~"))
     lan, ts = split_ips()
+    try:
+        load = list(os.getloadavg())
+    except Exception:
+        load = None
     return {
         "node": name,
         "hostname": socket.gethostname(),
         "os": sys.platform,
         "python": sys.version.split()[0],
         "cores": os.cpu_count(),
-        "load": os.getloadavg(),
+        "load": load,
         "mem_total_mb": mem_total,
         "mem_avail_mb": mem_avail,
         "disk_free_gb": round(disk.free / 1e9, 1),
@@ -303,12 +352,32 @@ def publish_ntfy(payload):
     body = json.dumps(payload).encode()
     req = urllib.request.Request(url, data=body, method="POST")
     req.add_header("Content-Type", "text/plain; charset=utf-8")
-    try:
-        with urllib.request.urlopen(req, timeout=10) as r:
-            return 200 <= r.status < 300
-    except Exception as e:
-        print("[rendezvous] publish failed (%s); will retry" % e, flush=True)
-        return False
+    contexts = [make_ssl_context()]
+    if hasattr(ssl, "_create_unverified_context"):
+        contexts.append("unverified")
+    for ctx in contexts:
+        try:
+            if ctx == "unverified":
+                if not TLS_DEGRADED[0]:
+                    TLS_DEGRADED[0] = True
+                    print(
+                        "[tls] ntfy publish retrying without certificate "
+                        "verification (old/missing CA store)",
+                        flush=True,
+                    )
+                ctx = ssl._create_unverified_context()
+            opener = urllib.request.build_opener(
+                urllib.request.HTTPSHandler(context=ctx)
+            )
+            with opener.open(req, timeout=10) as r:
+                return 200 <= r.getcode() < 300
+        except Exception as e:
+            if _cert_verify_failed(e):
+                continue
+            print("[rendezvous] publish failed (%s); will retry" % e, flush=True)
+            return False
+    print("[rendezvous] publish failed (TLS on this device); will retry", flush=True)
+    return False
 
 
 # --- minimal MQTT 3.1.1 client (stdlib only) ---
@@ -327,14 +396,75 @@ MQTT_BROKERS = [
     {
         "name": "emqx",
         "wss": [("broker.emqx.io", 8084, "/mqtt")],
+        "ws": [("broker.emqx.io", 8083, "/mqtt")],
         "tcp": [("broker.emqx.io", 1883, False), ("broker.emqx.io", 8883, True)],
     },
     {
         "name": "mosquitto",
         "wss": [("test.mosquitto.org", 8081, "/mqtt"), ("test.mosquitto.org", 8081, "/")],
+        "ws": [("test.mosquitto.org", 8080, "/mqtt")],
         "tcp": [("test.mosquitto.org", 1883, False), ("test.mosquitto.org", 8883, True)],
     },
 ]
+
+
+TLS_DEGRADED = [False]  # True once we fall back to unverified TLS
+
+
+def _ca_bundle():
+    """Locate a CA bundle file, including Termux and old-distro paths."""
+    env = os.environ.get("SSL_CERT_FILE")
+    if env and os.path.exists(env):
+        return env
+    prefix = os.environ.get("PREFIX", "")
+    candidates = []
+    if prefix:
+        candidates.append(os.path.join(prefix, "etc/tls/cert.pem"))
+        candidates.append(os.path.join(prefix, "etc/ssl/certs/ca-certificates.crt"))
+    candidates.extend(
+        [
+            "/etc/tls/cert.pem",
+            "/etc/ssl/certs/ca-certificates.crt",
+            "/etc/pki/tls/certs/ca-bundle.crt",
+            "/etc/ssl/cert.pem",
+            "/etc/ssl/certs/ca-bundle.crt",
+            os.path.expanduser("~/.termux/ssl/cert.pem"),
+        ]
+    )
+    for path in candidates:
+        if path and os.path.exists(path):
+            return path
+    return None
+
+
+def make_ssl_context():
+    """A verified TLS context using the best CA bundle we can find."""
+    bundle = _ca_bundle()
+    try:
+        if bundle:
+            return ssl.create_default_context(cafile=bundle)
+        return ssl.create_default_context()
+    except Exception:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_SSLv23)
+        ctx.verify_mode = ssl.CERT_REQUIRED
+        return ctx
+
+
+def _cert_verify_failed(e):
+    if isinstance(e, getattr(ssl, "CertificateError", ())):
+        return True
+    msg = str(e).lower()
+    needles = (
+        "certificate_verify_failed",
+        "certificate verify failed",
+        "self-signed certificate",
+        "self signed certificate",
+        "unable to get local issuer",
+        "certificate has expired",
+        "doesn't match",
+        "not trusted",
+    )
+    return any(n in msg for n in needles)
 
 
 def _sock_timeouts(s, sec):
@@ -374,8 +504,8 @@ def _no_proxy(host):
     return False
 
 
-def _open_connection(host, port, use_tls, timeout=15):
-    """TCP (optionally via proxy CONNECT) + optional TLS. Blocking mode."""
+def _open_plain(host, port, timeout=15):
+    """Plain TCP (optionally via proxy CONNECT). Blocking mode."""
     proxy = None if _no_proxy(host) else _proxy_url()
     if proxy:
         s = socket.create_connection((proxy.hostname, proxy.port or 3128), timeout=timeout)
@@ -402,21 +532,58 @@ def _open_connection(host, port, use_tls, timeout=15):
         status = buf.split(b"\r\n", 1)[0].decode("utf-8", "replace")
         if " 200" not in status:
             raise OSError("proxy CONNECT failed: %s" % status)
-    else:
-        s = socket.create_connection((host, port), timeout=timeout)
-        _sock_timeouts(s, timeout)
-    if use_tls:
-        ctx = ssl.create_default_context()
-        s = ctx.wrap_socket(s, server_hostname=host)
-        _sock_timeouts(s, timeout)
+        return s
+    s = socket.create_connection((host, port), timeout=timeout)
+    _sock_timeouts(s, timeout)
     return s
+
+
+def _open_connection(host, port, use_tls, timeout=15):
+    """TCP + optional TLS. Blocking mode.
+
+    Old Android/Termux and old Linux installs often have no usable CA
+    store, so certificate verification fails outright. When that (and
+    only that) happens, reconnect once and retry without verification:
+    a found node beats no node, and the session access key itself never
+    travels over these rendezvous connections."""
+    s = _open_plain(host, port, timeout)
+    if not use_tls:
+        return s
+    try:
+        s2 = make_ssl_context().wrap_socket(s, server_hostname=host)
+        _sock_timeouts(s2, timeout)
+        return s2
+    except ssl.SSLError as e:
+        if not _cert_verify_failed(e):
+            raise
+        try:
+            s.close()
+        except Exception:
+            pass
+        if not TLS_DEGRADED[0]:
+            TLS_DEGRADED[0] = True
+            print(
+                "[tls] certificate verification failed on this device; "
+                "retrying without verification (old/missing CA store). "
+                "Only rendezvous traffic uses this.",
+                flush=True,
+            )
+        s = _open_plain(host, port, timeout)
+        if hasattr(ssl, "_create_unverified_context"):
+            ctx = ssl._create_unverified_context()
+        else:
+            ctx = ssl.SSLContext(ssl.PROTOCOL_SSLv23)
+            ctx.verify_mode = ssl.CERT_NONE
+        s2 = ctx.wrap_socket(s, server_hostname=host)
+        _sock_timeouts(s2, timeout)
+        return s2
 
 
 class _WSConn:
     """Minimal WebSocket client: binary messages, ping/pong, no deps."""
 
-    def __init__(self, host, port, path, timeout=15):
-        self.sock = _open_connection(host, port, True, timeout)
+    def __init__(self, host, port, path, timeout=15, use_tls=True):
+        self.sock = _open_connection(host, port, use_tls, timeout)
         key = base64.b64encode(os.urandom(16)).decode()
         req = (
             "GET %s HTTP/1.1\r\nHost: %s:%d\r\nUpgrade: websocket\r\n"
@@ -523,8 +690,8 @@ class _MQTTConn:
         self.buf = b""
 
     @classmethod
-    def over_ws(cls, host, port, path, timeout=15):
-        return cls("ws", ws=_WSConn(host, port, path, timeout))
+    def over_ws(cls, host, port, path, timeout=15, use_tls=True):
+        return cls("ws", ws=_WSConn(host, port, path, timeout, use_tls))
 
     @classmethod
     def over_tcp(cls, host, port, use_tls, timeout=12):
@@ -645,11 +812,19 @@ def _mqtt_client_id(tag):
 
 
 def _broker_transports(broker):
-    """Yield (label, connect_fn) for one broker, WSS first, then TCP."""
+    """Yield (label, connect_fn) for one broker: WSS first, then plain
+    WS (for devices whose TLS cannot work at all), then raw TCP."""
     for host, port, path in broker["wss"]:
         yield (
             "wss://%s:%d%s" % (host, port, path),
             lambda h=host, p=port, pa=path: _MQTTConn.over_ws(h, p, pa, timeout=15),
+        )
+    for host, port, path in broker.get("ws", []):
+        yield (
+            "ws://%s:%d%s" % (host, port, path),
+            lambda h=host, p=port, pa=path: _MQTTConn.over_ws(
+                h, p, pa, timeout=15, use_tls=False
+            ),
         )
     for host, port, use_tls in broker["tcp"]:
         scheme = "mqtts" if use_tls else "mqtt"
@@ -728,8 +903,16 @@ def publish_rendezvous(port, name):
 
 
 def rendezvous_loop(port, name):
+    first = True
     while True:
-        publish_rendezvous(port, name)
+        ok = publish_rendezvous(port, name)
+        if first:
+            print(
+                "[rendezvous] first publish %s"
+                % ("ok" if ok else "FAILED; retrying every 60s"),
+                flush=True,
+            )
+            first = False
         time.sleep(60)
 
 
@@ -739,27 +922,64 @@ def rendezvous_loop(port, name):
 def tunnel_loop(port, name):
     global TUNNEL_URL
     exe = shutil.which("cloudflared")
-    if not exe:
+    if exe:
+        try:
+            p = subprocess.Popen(
+                [exe, "tunnel", "--url", "http://127.0.0.1:%d" % port],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                universal_newlines=True,
+            )
+            pat = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com")
+            for line in p.stdout:
+                m = pat.search(line)
+                if m:
+                    with TUNNEL_LOCK:
+                        TUNNEL_URL = m.group(0)
+                    print("[tunnel] public URL: %s" % TUNNEL_URL, flush=True)
+                    publish_rendezvous(port, name)
+                    return
+            print("[tunnel] cloudflared exited without a URL", flush=True)
+        except Exception as e:
+            print("[tunnel] cloudflared failed to start: %s" % e, flush=True)
+    # Fallback for devices where cloudflared is missing or cannot run
+    # (old Android/Termux, 32-bit builds, old distros): an ssh reverse
+    # tunnel via localhost.run, when ssh exists.
+    ssh = shutil.which("ssh")
+    if not ssh:
         return
     try:
         p = subprocess.Popen(
-            [exe, "tunnel", "--url", "http://127.0.0.1:%d" % port],
+            [
+                ssh,
+                "-o",
+                "StrictHostKeyChecking=no",
+                "-o",
+                "UserKnownHostsFile=/dev/null",
+                "-o",
+                "ServerAliveInterval=30",
+                "-o",
+                "ExitOnForwardFailure=yes",
+                "-R",
+                "80:127.0.0.1:%d" % port,
+                "nokey@localhost.run",
+            ],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            text=True,
+            universal_newlines=True,
         )
     except Exception as e:
-        print("[tunnel] cloudflared failed to start: %s" % e, flush=True)
+        print("[tunnel] ssh tunnel failed to start: %s" % e, flush=True)
         return
-    pat = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com")
+    pat = re.compile(r"https://[a-z0-9.-]+\.(?:localhost\.run|lhr\.life)")
     for line in p.stdout:
         m = pat.search(line)
         if m:
             with TUNNEL_LOCK:
                 TUNNEL_URL = m.group(0)
-            print("[tunnel] public URL: %s" % TUNNEL_URL, flush=True)
+            print("[tunnel] public URL (ssh): %s" % TUNNEL_URL, flush=True)
             publish_rendezvous(port, name)
-            break
+            return
 
 
 CONSOLE = """<!doctype html>
@@ -879,6 +1099,14 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
+    if sys.version_info < (3, 6):
+        print(
+            "bro-node needs Python 3.6 or newer (this is %s). "
+            "Update Python on this device and try again."
+            % sys.version.split()[0],
+            flush=True,
+        )
+        return
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=int(os.environ.get("BRO_NODE_PORT", "8899")))
     ap.add_argument("--name", default=os.environ.get("BRO_NODE_NAME", socket.gethostname()))
@@ -899,6 +1127,11 @@ def main():
     print("", flush=True)
     print("  Tell bro: PIN %s + ACCESS KEY (above)" % PIN, flush=True)
     print("  The access key is new every start. Keep this terminal open.", flush=True)
+    print(
+        "  Python %s | CA bundle: %s"
+        % (sys.version.split()[0], _ca_bundle() or "system default"),
+        flush=True,
+    )
     print("=" * 56, flush=True)
     try:
         srv.serve_forever()

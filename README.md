@@ -3,7 +3,8 @@
 A tiny server you run on any of your machines so bro can get on it and work:
 run commands, move files, and use the machine as extra processing power.
 One Python file, standard library only, nothing else to install beyond
-Python 3. Works on Linux and on Android through Termux.
+Python 3.6 or newer. Works on Linux and on Android through Termux,
+including older devices (see "Older Android / older Linux" below).
 
 This is separate from the older linuxtomux bridge: bro-node is the
 stripped-down version. Start the server, send bro two short things, done.
@@ -105,6 +106,42 @@ cd bro-node && nohup python3 server.py > ~/.bro-node/server.log 2>&1 &
 
 (The new PIN + key are in that log file. Remember: a restart means a
 new key.)
+
+## Older Android / older Linux (v2.2)
+
+Old gear works. The floor is **Python 3.6**, so an old Termux, an old
+Android tablet, or an old Linux distro (Debian 9 era, CentOS 7) can run
+the node as long as it has Python 3.6+:
+
+```sh
+git clone https://github.com/jaykk99/bro-node
+cd bro-node
+python3 server.py
+```
+
+(If `git` is missing too, download just the one file and run it:
+`curl -LO https://raw.githubusercontent.com/jaykk99/bro-node/main/server.py`
+then `python3 server.py`.)
+
+What v2.2 fixes for old devices:
+
+- **No CA certificates needed.** Old Termux installs fail with
+  `CERTIFICATE_VERIFY_FAILED` because they have no CA store. The node
+  now hunts for a CA bundle in the usual places (including Termux's own
+  paths), and if verification still fails it retries the rendezvous
+  connection without verification instead of dying. The startup banner
+  shows which CA bundle it found. Installing `ca-certificates`
+  (`pkg install -y ca-certificates`) is still the cleaner fix when the
+  package is available.
+- **Plain broker transports.** If TLS cannot work at all on the
+  device, the rendezvous also tries plain (unencrypted) WebSocket and
+  plain MQTT to the same public brokers.
+- **No cloudflared needed.** If `cloudflared` is missing or cannot run
+  on the device (old/32-bit builds), the node falls back to an `ssh`
+  reverse tunnel (localhost.run) when `ssh` is installed, and still
+  announces its LAN address either way.
+- **Old Python shims.** No 3.7+-only calls remain; if Python is older
+  than 3.6 the node says so in plain words at startup.
 
 ## Reaching the node from outside home wifi (optional)
 
