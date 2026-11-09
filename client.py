@@ -664,6 +664,91 @@ def candidate_bases(payload):
     return bases
 
 
+
+def _mqtt_publish_qos0ret(conn, topic, payload, packet_id, retain):
+    """Publish QoS1 with an explicit retain flag (the vendored
+    publish_qos1 always retains; commands must NOT be retained or a
+    reconnecting node would re-run them)."""
+    var = _enc_str(topic) + struct.pack("!H", packet_id)
+    first = 0x32 | (0x01 if retain else 0x00)
+    conn.send(bytes([first]) + _enc_rem(len(var) + len(payload)) + var + payload)
+    while True:
+        ptype, _, body = conn.recv_packet()
+        if ptype == 4 and len(body) >= 2 and struct.unpack("!H", body[:2])[0] == packet_id:
+            return
+
+
+def mqtt_roundtrip(pin, key, cmd, timeout_s=75):
+    """Run one command over the MQTT command channel and return its
+    result dict. No tunnel or IP needed: same brokers as discovery."""
+    base = mqtt_rendezvous_topic(key)
+    cmd_topic = base + "/cmd"
+    res_topic = base + "/res"
+    rid = uuid.uuid4().hex
+    req = json.dumps({"id": rid, "pin": str(pin), "cmd": cmd}).encode("utf-8")
+    last_err = None
+    for broker in MQTT_BROKERS:
+        for label, connect in _broker_transports(broker):
+            conn = None
+            try:
+                conn = connect()
+                conn.connect(_mqtt_client_id("cmd"))
+                sbody = struct.pack("!H", 9) + _enc_str(res_topic) + bytes([1])
+                conn.send(bytes([0x82]) + _enc_rem(len(sbody)) + sbody)
+                _mqtt_publish_qos0ret(conn, cmd_topic, req, packet_id=21, retain=False)
+                deadline = time.time() + timeout_s
+                last_ping = time.time()
+                while time.time() < deadline:
+                    try:
+                        ptype, flags, body = conn.recv_packet()
+                    except (OSError, socket.error):
+                        if time.time() - last_ping > 30:
+                            conn.ping()
+                            last_ping = time.time()
+                            continue
+                        raise
+                    if ptype != 3:
+                        continue
+                    tl = struct.unpack("!H", body[:2])[0]
+                    tpc = body[2:2 + tl].decode("utf-8", "replace")
+                    off = 2 + tl
+                    pkt_id = None
+                    if (flags >> 1) & 3:
+                        pkt_id = struct.unpack("!H", body[off:off + 2])[0]
+                        off += 2
+                    if pkt_id is not None:
+                        conn.send(bytes([0x40, 0x02]) + struct.pack("!H", pkt_id))
+                    if tpc != res_topic:
+                        continue
+                    try:
+                        res = json.loads(body[off:].decode("utf-8", "replace"))
+                    except Exception:
+                        continue
+                    if res.get("id") == rid:
+                        return res.get("result") or {}
+                raise RuntimeError("mqtt command timed out after %ds" % timeout_s)
+            except Exception as e:
+                last_err = e
+            finally:
+                if conn:
+                    conn.close()
+    raise RuntimeError("mqtt command channel unreachable (%s)" % last_err)
+
+
+def run_action_mqtt(pin, key, action, rest):
+    if action == "status":
+        print(json.dumps(mqtt_roundtrip(pin, key, "__status__"), indent=2))
+    elif action == "exec":
+        out = mqtt_roundtrip(pin, key, rest[0])
+        sys.stdout.write(out.get("stdout", ""))
+        sys.stderr.write(out.get("stderr", ""))
+        return out.get("exit", 1)
+    else:
+        print("--mqtt supports only status and exec")
+        return 1
+    return 0
+
+
 def discover(pin, key, ntfy_base=NTFY_BASE):
     """Find a reachable base URL for the node using only PIN + key.
 
@@ -727,6 +812,7 @@ def main():
     pin = os.environ.get("BRO_NODE_PIN", "")
     key = ""
     url = ""
+    use_mqtt = False
     ntfy_base = NTFY_BASE
     positional = []
     i = 0
@@ -740,6 +826,8 @@ def main():
             url = argv[i + 1]; i += 2
         elif a == "--ntfy-base":
             ntfy_base = argv[i + 1].rstrip("/"); i += 2
+        elif a == "--mqtt":
+            use_mqtt = True; i += 1
         else:
             positional.append(a); i += 1
 
@@ -756,6 +844,9 @@ def main():
     if not key:
         print("error: --key <access_key> is required")
         return 1
+
+    if use_mqtt:
+        return run_action_mqtt(pin, key, action, rest)
 
     if not url:
         try:

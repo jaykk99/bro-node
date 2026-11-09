@@ -916,6 +916,93 @@ def rendezvous_loop(port, name):
         time.sleep(60)
 
 
+
+# --- MQTT command channel ---
+# Tunnels (cloudflared / localhost.run) keep proving flaky: the URL
+# prints, then the tunnel drops. The MQTT brokers already carry
+# discovery reliably, so they carry commands too. Topics derive from
+# the session access key; every command must also carry the PIN.
+# Results are capped well under public-broker packet limits.
+
+MQTT_CMD_CAP = 32000
+
+
+def _mqtt_handle_cmd(req, port, name):
+    rid = req.get("id", "")
+    cmd = req.get("cmd", "")
+    if cmd == "__status__":
+        return {"id": rid, "result": status(port, name)}
+    out = run_cmd(cmd, timeout_s=60)
+    out = dict(out)
+    out["stdout"] = (out.get("stdout") or "")[-MQTT_CMD_CAP:]
+    out["stderr"] = (out.get("stderr") or "")[-MQTT_CMD_CAP:]
+    return {"id": rid, "result": out}
+
+
+def mqtt_cmd_loop(port, name):
+    base = mqtt_rendezvous_topic()
+    cmd_topic = base + "/cmd"
+    res_topic = base + "/res"
+    seen_ids = set()
+    pid_ctr = [1000]
+    while True:
+        for broker in MQTT_BROKERS:
+            for label, connect in _broker_transports(broker):
+                conn = None
+                try:
+                    conn = connect()
+                    conn.connect(_mqtt_client_id("cmd"))
+                    sbody = struct.pack("!H", 9) + _enc_str(cmd_topic) + bytes([1])
+                    conn.send(bytes([0x82]) + _enc_rem(len(sbody)) + sbody)
+                    print("[mqtt-cmd] listening via %s (%s)" % (label, broker["name"]), flush=True)
+                    last_ping = time.time()
+                    while True:
+                        try:
+                            ptype, flags, body = conn.recv_packet()
+                        except (OSError, socket.error):
+                            if time.time() - last_ping > 30:
+                                conn.ping()
+                                last_ping = time.time()
+                                continue
+                            raise
+                        if ptype != 3:  # not PUBLISH: SUBACK/PINGRESP/etc.
+                            continue
+                        tl = struct.unpack("!H", body[:2])[0]
+                        tpc = body[2:2 + tl].decode("utf-8", "replace")
+                        off = 2 + tl
+                        pkt_id = None
+                        if (flags >> 1) & 3:  # QoS > 0 carries a packet id
+                            pkt_id = struct.unpack("!H", body[off:off + 2])[0]
+                            off += 2
+                        if pkt_id is not None:
+                            conn.send(bytes([0x40, 0x02]) + struct.pack("!H", pkt_id))
+                        if tpc != cmd_topic:
+                            continue
+                        try:
+                            req = json.loads(body[off:].decode("utf-8", "replace"))
+                        except Exception:
+                            continue
+                        if req.get("pin") != PIN or not req.get("id"):
+                            continue
+                        if req["id"] in seen_ids:
+                            continue
+                        seen_ids.add(req["id"])
+                        res = _mqtt_handle_cmd(req, port, name)
+                        pid_ctr[0] += 1
+                        conn.publish_qos1(
+                            res_topic,
+                            json.dumps(res).encode("utf-8"),
+                            packet_id=pid_ctr[0] % 60000 + 1,
+                        )
+                except Exception as e:
+                    print("[mqtt-cmd] connection dropped (%s); reconnecting" % e, flush=True)
+                finally:
+                    if conn:
+                        conn.close()
+                time.sleep(2)
+        time.sleep(3)
+
+
 # --- optional Cloudflare quick tunnel ---
 
 
@@ -1141,6 +1228,7 @@ def main():
 
     threading.Thread(target=tunnel_loop, args=(args.port, args.name), daemon=True).start()
     threading.Thread(target=rendezvous_loop, args=(args.port, args.name), daemon=True).start()
+    threading.Thread(target=mqtt_cmd_loop, args=(args.port, args.name), daemon=True).start()
 
     print("=" * 56, flush=True)
     print("  bro-node is running: %s" % args.name, flush=True)
