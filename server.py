@@ -930,7 +930,11 @@ def tunnel_loop(port, name):
                 stderr=subprocess.STDOUT,
                 universal_newlines=True,
             )
-            pat = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com")
+            # Quick-tunnel hostnames always contain hyphens (random
+            # word combos). A bare "api.trycloudflare.com" also fits
+            # the naive pattern and appears in cloudflared's early log
+            # lines, so require a hyphen and skip the api host.
+            pat = re.compile(r"https://[a-z0-9]+(?:-[a-z0-9]+)+\.trycloudflare\.com")
             for line in p.stdout:
                 m = pat.search(line)
                 if m:
