@@ -935,14 +935,23 @@ def tunnel_loop(port, name):
             # the naive pattern and appears in cloudflared's early log
             # lines, so require a hyphen and skip the api host.
             pat = re.compile(r"https://[a-z0-9]+(?:-[a-z0-9]+)+\.trycloudflare\.com")
+            announced = False
             for line in p.stdout:
+                if announced:
+                    # Keep draining: if nobody reads the pipe,
+                    # cloudflared blocks on its own log writes once
+                    # the buffer fills, its keepalives stall, and the
+                    # edge drops the tunnel (Cloudflare error 530).
+                    continue
                 m = pat.search(line)
                 if m:
                     with TUNNEL_LOCK:
                         TUNNEL_URL = m.group(0)
                     print("[tunnel] public URL: %s" % TUNNEL_URL, flush=True)
                     publish_rendezvous(port, name)
-                    return
+                    announced = True
+            if announced:
+                return
             print("[tunnel] cloudflared exited without a URL", flush=True)
         except Exception as e:
             print("[tunnel] cloudflared failed to start: %s" % e, flush=True)
@@ -981,14 +990,19 @@ def tunnel_loop(port, name):
     # hostname. Skip those or the node announces a URL that 404s.
     skip_hosts = ("admin.localhost.run", "www.localhost.run",
                   "admin.lhr.life", "www.lhr.life")
+    announced = False
     for line in p.stdout:
+        if announced:
+            # Keep draining (see cloudflared note): an undrained
+            # pipe stalls ssh and localhost.run drops the tunnel.
+            continue
         m = pat.search(line)
         if m and m.group(0).split("://", 1)[1] not in skip_hosts:
             with TUNNEL_LOCK:
                 TUNNEL_URL = m.group(0)
             print("[tunnel] public URL (ssh): %s" % TUNNEL_URL, flush=True)
             publish_rendezvous(port, name)
-            return
+            announced = True
 
 
 CONSOLE = """<!doctype html>
