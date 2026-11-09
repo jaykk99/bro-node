@@ -972,9 +972,14 @@ def tunnel_loop(port, name):
         print("[tunnel] ssh tunnel failed to start: %s" % e, flush=True)
         return
     pat = re.compile(r"https://[a-z0-9.-]+\.(?:localhost\.run|lhr\.life)")
+    # localhost.run's ssh banner prints its admin/docs links
+    # (admin.localhost.run, www.localhost.run) BEFORE the real tunnel
+    # hostname. Skip those or the node announces a URL that 404s.
+    skip_hosts = ("admin.localhost.run", "www.localhost.run",
+                  "admin.lhr.life", "www.lhr.life")
     for line in p.stdout:
         m = pat.search(line)
-        if m:
+        if m and m.group(0).split("://", 1)[1] not in skip_hosts:
             with TUNNEL_LOCK:
                 TUNNEL_URL = m.group(0)
             print("[tunnel] public URL (ssh): %s" % TUNNEL_URL, flush=True)
